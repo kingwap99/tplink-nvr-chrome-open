@@ -1,0 +1,166 @@
+#!/bin/bash
+# tplink-nvr-chrome-open
+# Open a TP-Link (AWTK/WebAssembly UI) NVR web page in Google Chrome.
+#
+# These NVRs gate their UI behind a User-Agent sniff:
+#     is64Bit = /Win64|x86_64/.test(navigator.userAgent)
+# If it does not match, the page shows "当前浏览器不支持此功能..." and stays blank.
+# Apple Silicon Chrome UAs contain neither token, so we spoof a Windows x64 UA.
+#
+# --user-agent is silently ignored when a Chrome instance is already running,
+# so we always launch a dedicated instance with its own --user-data-dir.
+#
+# Usage:
+#   tplink-nvr-chrome-open                 # auto-scan the LAN for NVRs
+#   tplink-nvr-chrome-open 192.168.31.11 # open a specific host
+#   tplink-nvr-chrome-open 192.168.31.11:80
+#   tplink-nvr-chrome-open --scan        # scan only, print candidates
+#   tplink-nvr-chrome-open --port 8080   # override probe port (default 80)
+#
+# Options:
+#   --port N       probe/serve port (default: 80)
+#   --scan         scan and list candidates, do not open Chrome
+#   --subnet CIDR  override the auto-detected /24 (e.g. 192.168.1.0/24)
+#   --parallel N   scan concurrency (default: 64)
+#   --no-cache     ignore the cached host and force a fresh scan
+
+set -u
+
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+BASE_DIR="${HOME}/.tplink-nvr-chrome-open"
+CACHE_FILE="${BASE_DIR}/last_host"
+PORT=80
+SCAN_ONLY=0
+PARALLEL=64
+SUBNET=""
+FORCE_SCAN=0
+HOST=""
+
+mkdir -p "${BASE_DIR}"
+
+log()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# ---------- argument parsing ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port)      [ $# -ge 2 ] || die "--port needs a value"; PORT="$2"; shift 2 ;;
+    --scan)      SCAN_ONLY=1; shift ;;
+    --subnet)    [ $# -ge 2 ] || die "--subnet needs a value"; SUBNET="$2"; shift 2 ;;
+    --parallel)  [ $# -ge 2 ] || die "--parallel needs a value"; PARALLEL="$2"; shift 2 ;;
+    --no-cache)  FORCE_SCAN=1; shift ;;
+    -h|--help)   usage 0 ;;
+    -*)          die "unknown option: $1 (see --help)" ;;
+    *)
+      [ -z "${HOST}" ] || die "only one host may be given (got '${HOST}' and '$1')"
+      HOST="$1"; shift ;;
+  esac
+done
+
+# ---------- probe: is this an AWTK NVR web UI? ----------
+probe_host() {
+  # $1 = host, $2 = port. Prints host if it looks like the NVR UI.
+  local h="$1" p="$2" body
+  body=$(curl -sf -m 2 "http://${h}:${p}/" 2>/dev/null) || return 1
+  case "${body}" in
+    *awtk*|*"awtk-lcd"*|*"<title>NVR"*) printf '%s\n' "${h}:${p}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- auto-scan the LAN ----------
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROBE="${SCRIPT_DIR}/lib/probe.sh"
+
+detect_subnets() {
+  # Derive /24 subnets from active interface IPv4 addresses,
+  # default-route interface first.
+  {
+    route -n get default 2>/dev/null | awk '/interface:/{print $2}' | while read -r iface; do
+      ipconfig getifaddr "${iface}" 2>/dev/null
+    done
+    for iface in $(networksetup -listallhardwareports 2>/dev/null | awk '/Device:/{print $2}'); do
+      ipconfig getifaddr "${iface}" 2>/dev/null
+    done
+  } | awk -F. 'NF==4 && $1!="127" {print $1"."$2"."$3".0/24"}' | awk '!seen[$0]++'
+}
+
+scan_subnet() {
+  # $1 = a.b.c.0/24, scans .1-.254 on port $PORT with bounded parallelism.
+  # Results are appended to the file given as $2.
+  # NOTE: we call lib/probe.sh instead of inlining the probe body into
+  # `xargs -I{} sh -c ...` — BSD xargs (macOS) rejects long command
+  # templates with "command line cannot be assembled, too long".
+  local prefix results
+  prefix=$(printf '%s' "$1" | awk -F. '{print $1"."$2"."$3}')
+  results="$2"
+  seq 1 254 | awk -v p="${prefix}" '{print p"."$1}' \
+    | PROBE_PORT="${PORT}" PROBE_RESULTS="${results}" xargs -P "${PARALLEL}" -n 1 "${PROBE}"
+}
+
+# ---------- launch Chrome ----------
+open_chrome() {
+  # $1 = host[:port]
+  local target="$1" profile
+  profile="${BASE_DIR}/profile-$(printf '%s' "${target}" | tr ':/' '__')"
+  command -v open >/dev/null 2>&1 || die "open(1) not found — this helper is macOS-only"
+  [ -d "/Applications/Google Chrome.app" ] || die "Google Chrome not found in /Applications"
+  log "opening ${target} (profile: ${profile})"
+  open -n -a "Google Chrome" --args \
+    --user-agent="${UA}" \
+    --user-data-dir="${profile}" \
+    --no-first-run \
+    "http://${target}/"
+  printf '%s\n' "${target}" > "${CACHE_FILE}"
+}
+
+# ---------- main ----------
+if [ -n "${HOST}" ]; then
+  # explicit host: normalize port if given inline, else use --port
+  case "${HOST}" in
+    *:*) TARGET="${HOST}" ;;
+    *)   TARGET="${HOST}:${PORT}" ;;
+  esac
+  open_chrome "${TARGET}"
+  exit 0
+fi
+
+# no host given: cache -> scan
+if [ "${FORCE_SCAN}" -eq 0 ] && [ -s "${CACHE_FILE}" ]; then
+  CACHED=$(cat "${CACHE_FILE}")
+  log "using cached host ${CACHED} (--no-cache to rescan)"
+  if probe_host "${CACHED%%:*}" "${CACHED##*:}" >/dev/null; then
+    open_chrome "${CACHED}"
+    exit 0
+  fi
+  log "cached host is dead, rescanning..."
+fi
+
+SUBNETS="${SUBNET:-$(detect_subnets)}"
+[ -n "${SUBNETS}" ] || die "could not detect any LAN subnet; pass one with --subnet a.b.c.0/24"
+
+log "scanning LAN for AWTK NVR UIs (port ${PORT})..."
+RESULTS="${BASE_DIR}/scan-results.$$"
+: > "${RESULTS}"
+for s in ${SUBNETS}; do scan_subnet "${s}" "${RESULTS}"; done
+FOUND=$(sort -t. -k4,4n -u "${RESULTS}")
+rm -f "${RESULTS}"
+
+if [ -z "${FOUND}" ]; then
+  die "no NVR found on: $(printf '%s ' ${SUBNETS})— pass a host explicitly"
+fi
+
+log "found:"
+printf '  %s\n' ${FOUND} >&2
+
+if [ "${SCAN_ONLY}" -eq 1 ]; then
+  exit 0
+fi
+
+FIRST=$(printf '%s\n' "${FOUND}" | head -1)
+open_chrome "${FIRST}"
